@@ -1,0 +1,12 @@
+# Escludi tutta la cartella della cache
+f1_cache/
+
+# Escludi file database pesanti
+*.sqlite
+*.db
+
+# Escludi cartelle di sistema e IDE
+.DS_Store
+.idea/
+venv/
+__pycache__/
