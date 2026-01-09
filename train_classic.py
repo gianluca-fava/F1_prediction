@@ -155,18 +155,10 @@ def main():
         print(f"✅ Dataset salvato con successo in {processed_data_path}")
 
     print("\n--- [CLASSIC] 2. PREPARAZIONE DATASET ---")
-    # --- TARGET ENCODING V4 ---
-    print("Calcolo Target Encoding (Driver/Team Value)...")
-    train_mask_enc = df['Year'] < 2025
-    
-    # Valore Pilota: media posizione finale storica (solo sul train per evitare leakage)
-    driver_map = df[train_mask_enc].groupby('Driver')['FinalPosition'].mean().to_dict()
-    df['Driver_Value'] = df['Driver'].map(driver_map).fillna(df['FinalPosition'].mean())
-    
-    # Valore Team: media posizione finale storica
-    team_map = df[train_mask_enc].groupby('Team')['FinalPosition'].mean().to_dict()
-    df['Team_Value'] = df['Team'].map(team_map).fillna(df['FinalPosition'].mean())
-
+    le_driver = LabelEncoder()
+    df['Driver_Encoded'] = le_driver.fit_transform(df['Driver'])
+    le_team = LabelEncoder()
+    df['Team_Encoded'] = le_team.fit_transform(df['Team'])
     le_circuit = LabelEncoder()
     df['Circuit_Encoded'] = le_circuit.fit_transform(df['Circuit'])
     le_compound = LabelEncoder()
@@ -176,38 +168,45 @@ def main():
     df_dummies = pd.get_dummies(df['startCompound'], prefix='tyre')
     df = pd.concat([df, df_dummies], axis=1)
 
-    # Save mapping per predizioni future
-    joblib.dump(driver_map, 'driver_target_map.joblib')
-    joblib.dump(team_map, 'team_target_map.joblib')
+    # Save encoders
+    joblib.dump(le_driver, 'le_driver.joblib')
+    joblib.dump(le_team, 'le_team.joblib')
     joblib.dump(le_circuit, 'le_circuit.joblib')
     joblib.dump(le_compound, 'le_compound.joblib')
 
-    features_rf = ['Driver_Value', 'Team_Value', 'Circuit_Encoded', 'Compound_Label',
+    # Feature Set per il Classificatore DNF (senza i nuovi ID per ora)
+    features_dnf = ['Driver_Encoded', 'Team_Encoded', 'Circuit_Encoded', 'GridPosition', 
+                    'RecentForm', 'TeamForm', 'DriverStability', 'is_wet']
+    
+    # Feature Set per il Regressore (includerà la probabilità DNF dopo)
+    # Feature Set Finale (Race Pace Expert)
+    features_rf = ['Driver_Encoded', 'Team_Encoded', 'Circuit_Encoded', 'Compound_Label',
                    'GridPosition', 'RecentForm', 'TeamForm', 'DriverStability', 
                    'CircuitOvertakeFactor', 'TeammateDiff', 'OutPosition', 'TrackGrip', 'is_wet']
     
     features_mlp = features_rf + list(df_dummies.columns)
 
     # --- PREPARAZIONE TARGET (DELTA MODE) ---
-    # Prediciamo lo spostamento rispetto alla griglia: Final - Grid
-    # Es: Parte 5°, arriva 3° => Delta = -2 (guadagna posizioni)
-    # Es: Parte 2°, arriva 10° => Delta = +8 (perde posizioni)
     df['PositionDelta'] = df['FinalPosition'] - df['GridPosition']
     target = 'PositionDelta'
 
     # Split
     train_mask = (df['Year'] >= 2018) & (df['Year'] <= 2024)
+    # FILTRO: Per il training usiamo solo chi ha finito la gara per imparare il passo reale
+    train_mask_clean = train_mask & (df['is_DNF'] == 0)
+    
     test_mask = (df['Year'] == 2025)
 
-    # X e Y
-    X_train_rf = df.loc[train_mask, features_rf]
+    # X e Y (Training pulito, Test reale con DNF)
+    X_train_rf = df.loc[train_mask_clean, features_rf]
+    y_train = df.loc[train_mask_clean, target]
+    
     X_test_rf = df.loc[test_mask, features_rf]
-    X_train_mlp = df.loc[train_mask, features_mlp]
-    X_test_mlp = df.loc[test_mask, features_mlp]
-    y_train = df.loc[train_mask, target]
-    y_test_abs = df.loc[test_mask, 'FinalPosition'] # Per valutazione finale
-    y_test_delta = df.loc[test_mask, target]
+    y_test_abs = df.loc[test_mask, 'FinalPosition']
     grid_test = df.loc[test_mask, 'GridPosition']
+
+    X_train_mlp = df.loc[train_mask_clean, features_mlp]
+    X_test_mlp = df.loc[test_mask, features_mlp]
 
     # --- SCALING (only MLP!) ---
     scaler = RobustScaler()
@@ -215,48 +214,42 @@ def main():
     X_test_mlp_scaled = scaler.transform(X_test_mlp)
 
     # --- TRAINING ---
-    print("\n--- [CLASSIC] 3. ADDESTRAMENTO DIFFERENZIATO ---")
+    print("\n--- [V6] ADDESTRAMENTO RACE EXPERT (Finishers Only) ---")
 
-    # 1. DNF Classifier (Nuovo!)
-    print("Training DNF Classifier...")
-    dnf_model = HistGradientBoostingClassifier(random_state=42)
-    dnf_model.fit(X_train_rf, df.loc[train_mask, 'is_DNF'])
-    joblib.dump(dnf_model, 'f1_dnf_classifier.joblib')
-
-    # 2. HistGradientBoosting (Regressore Delta)
+    # 1. HistGradientBoosting (Regressore Delta)
     print("Training HistGradientBoosting Regressor...")
     hgb = HistGradientBoostingRegressor(
         loss='absolute_error',
         max_iter=500,
         learning_rate=0.03,
-        max_depth=12,
-        l2_regularization=0.5,
+        max_depth=10,
+        l2_regularization=1.5,
         random_state=42
     )
     hgb.fit(X_train_rf, y_train)
     joblib.dump(hgb, 'f1_hgb_model.joblib')
 
-    # 3. Random Forest
+    # 2. Random Forest
     print("Training RandomForest...")
-    rf = RandomForestRegressor(n_estimators=1000, max_depth=25, min_samples_leaf=7, random_state=42, n_jobs=-1)
+    rf = RandomForestRegressor(n_estimators=1000, max_depth=22, min_samples_leaf=8, random_state=42, n_jobs=-1)
     rf.fit(X_train_rf, y_train)
     joblib.dump(rf, 'f1_rf_best_model.joblib')
 
-    # 4. MLP
+    # 3. MLP
     print("Training MLP (Neural)...")
-    mlp = MLPRegressor(hidden_layer_sizes=(128, 64), activation='tanh', alpha=0.1, max_iter=5000, early_stopping=True, random_state=42)
+    mlp = MLPRegressor(hidden_layer_sizes=(64, 32), activation='tanh', alpha=0.5, max_iter=5000, early_stopping=True, random_state=42)
     mlp.fit(X_train_scaled, y_train)
     joblib.dump(mlp, 'f1_mlp_model.joblib')
 
     # --- EVALUATION ---
-    print("\n--- [CLASSIC] RISULTATI TEST SET (2025) - TARGET: DELTA ---")
+    print("\n--- [V6] RISULTATI TEST SET (2025) - RACE PACE EXPERT ---")
 
-    # Predizioni Delta pure
+    # Predizioni Delta
     hgb_delta = hgb.predict(X_test_rf)
     rf_delta = rf.predict(X_test_rf)
     mlp_delta = mlp.predict(X_test_mlp_scaled)
 
-    # Posizioni Finali (senza "sporcarle" con la probabilità di DNF)
+    # Posizioni Finali
     hgb_pred = np.clip(grid_test + hgb_delta, 1, 21)
     rf_pred = np.clip(grid_test + rf_delta, 1, 21)
     mlp_pred = np.clip(grid_test + mlp_delta, 1, 21)
@@ -266,13 +259,8 @@ def main():
     mae_rf = mean_absolute_error(y_test_abs, rf_pred)
     mae_mlp = mean_absolute_error(y_test_abs, mlp_pred)
 
-    r2_hgb = r2_score(y_test_abs, hgb_pred)
-    r2_rf = r2_score(y_test_abs, rf_pred)
-    r2_mlp = r2_score(y_test_abs, mlp_pred)
-
-    print(f"{'METRICA':<20} | {'HGB (V4)':<12} | {'RF':<12} | {'MLP':<12}")
+    print(f"{'METRICA':<20} | {'HGB (V6)':<12} | {'RF':<12} | {'MLP':<12}")
     print("-" * 65)
-    print(f"{'R2 Score':<20} | {r2_hgb:<12.4f} | {r2_rf:<12.4f} | {r2_mlp:<12.4f}")
     print(f"{'MAE (Posizioni)':<20} | {mae_hgb:<12.2f} | {mae_rf:<12.2f} | {mae_mlp:<12.2f}")
 
     print("\n" + "-" * 40)
@@ -280,7 +268,7 @@ def main():
     print("-" * 40)
 
     if hasattr(rf, 'feature_importances_'):
-        print("\nIMPORTANZA FEATURE (Random Forest):")
+        print("\nIMPORTANZA FEATURE (Random Forest V6):")
         feat_imp = sorted(zip(features_rf, rf.feature_importances_), key=lambda x: x[1], reverse=True)
         for name, imp in feat_imp:
             print(f"🔹 {name:<20}: {imp:.4f}")
