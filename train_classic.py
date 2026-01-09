@@ -7,10 +7,10 @@ import os
 # Configurazioni base
 os.environ['OMP_NUM_THREADS'] = '1'
 
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor, HistGradientBoostingClassifier
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import GridSearchCV
 from sklearn.model_selection import RandomizedSearchCV
@@ -65,24 +65,21 @@ def load_and_process_data():
 
         # DNF (Do Not Finish) - Last lap = NaN OR he hasn't completed 90% of the race laps => DNF
         final_pos_raw = group.iloc[-1]['Position']
+        dnf_flag = 0
         if pd.isna(final_pos_raw) or not is_classified:
             final_pos = 21
+            dnf_flag = 1
             print(f"🏳️ [DNF] {driver} @ {event} ({year})")
         else:
             final_pos = final_pos_raw
 
         # COMPOUND
         valid_compounds = group['Compound'].dropna()
-        if not valid_compounds.empty:
-            # first compound registred (lap 1 or 2)
-            start_compound = valid_compounds.iloc[0]
-        else:
-            start_compound = 'Unknown'
-            print(f"⚠️ [WARN] COMPOUND NOT FOUND {driver} @ {event} ({year})")
+        start_compound = valid_compounds.iloc[0] if not valid_compounds.empty else 'Unknown'
 
-        # WETHER
-        humidity = group['AvgHumidity'].mean() #average humidity for all the race
-        temperature = group['AvgTrackTemp'].mean()  # average temperature for all the race
+        # WEATHER
+        humidity = group['AvgHumidity'].mean()
+        temperature = group['AvgTrackTemp'].mean()
 
         data.append({
             'Year': year,
@@ -93,7 +90,8 @@ def load_and_process_data():
             'GridPosition': grid_pos,
             'Humidity': humidity,
             'Temperature': temperature,
-            'FinalPosition': final_pos
+            'FinalPosition': final_pos,
+            'is_DNF': dnf_flag
         })
 
     return pd.DataFrame(data)
@@ -113,31 +111,64 @@ def main():
         #If the pilot is using a compound for rain at the start => the race is wet
         df['is_wet'] = df['startCompound'].apply(lambda x: 1 if x in ['INTERMEDIATE', 'WET'] else 0)
 
-        # --- RECENT FORM ---
-        print("RecentForm calcoulation...")
+        # --- RECENT FORM & STABILITY ---
+        print("RecentForm (EWMA) and Stability calculation...")
         df = df.sort_values(by=['Year', 'Circuit', 'Team', 'Driver'])
-        #mean on the last 3 races for the pilot (not the actual race at the moment)
+        # EWMA: pesa di più l'ultima gara rispetto a 3 gare fa
         df['RecentForm'] = df.groupby('Driver')['FinalPosition'].transform(
-        lambda x: x.shift(1).rolling(window=3, min_periods=1).mean()
+            lambda x: x.shift(1).ewm(span=3, min_periods=1).mean()
         )
-        # TeamForm: mean on the 2 pilots on the last 2 racese (4 cars)
+        # TeamForm: media degli ultimi 2 GP (4 auto)
         df['TeamForm'] = df.groupby('Team')['FinalPosition'].transform(
-        lambda x: x.shift(2).rolling(window=4, min_periods=1).mean()
+            lambda x: x.shift(2).rolling(window=4, min_periods=1).mean()
         )
+        # DriverStability: deviazione standard delle ultime 5 gare
+        df['DriverStability'] = df.groupby('Driver')['FinalPosition'].transform(
+            lambda x: x.shift(1).rolling(window=5, min_periods=1).std()
+        ).fillna(0)
+
         # Fallback per valori mancanti
         df['RecentForm'] = df['RecentForm'].fillna(df['GridPosition'])
         df['TeamForm'] = df['TeamForm'].fillna(df['GridPosition'])
+
+        # --- FEATURE ENGINEERING V3 ---
+        print("Feature Engineering V3 (OvertakeFactor & TeammateDiff)...")
+        # 1. Circuit Overtake Factor: variabilità storica delle posizioni in questo circuito
+        # Circuiti con alta deviazione standard permettono più recuperi
+        circuit_map = df.groupby('Circuit')['FinalPosition'].std().to_dict()
+        df['CircuitOvertakeFactor'] = df['Circuit'].map(circuit_map).fillna(df['FinalPosition'].std())
+
+        # 2. Teammate Difference: quanto il pilota è più in forma del compagno?
+        # Confrontiamo la RecentForm del pilota con la media del team in quel weekend
+        df['TeammateDiff'] = df.groupby(['Year', 'Circuit', 'Team'])['RecentForm'].transform(
+            lambda x: x - x.mean()
+        ).fillna(0)
+
+        # 3. OutPosition: pilota veloce in griglia lenta (potenziale rimonta)
+        # Se RecentForm (posizione media arrivo) < GridPosition => il pilota è "dietro" rispetto al suo valore
+        df['OutPosition'] = df['GridPosition'] - df['RecentForm']
+
+        # 4. Track Grip Interaction
+        df['TrackGrip'] = df['Temperature'] * (100 - df['Humidity']) / 100
 
         df.to_parquet(processed_data_path, index=False)
         print(f"✅ Dataset salvato con successo in {processed_data_path}")
 
     print("\n--- [CLASSIC] 2. PREPARAZIONE DATASET ---")
-    le_driver = LabelEncoder()
-    df['Driver_Encoded'] = le_driver.fit_transform(df['Driver'])
+    # --- TARGET ENCODING V4 ---
+    print("Calcolo Target Encoding (Driver/Team Value)...")
+    train_mask_enc = df['Year'] < 2025
+    
+    # Valore Pilota: media posizione finale storica (solo sul train per evitare leakage)
+    driver_map = df[train_mask_enc].groupby('Driver')['FinalPosition'].mean().to_dict()
+    df['Driver_Value'] = df['Driver'].map(driver_map).fillna(df['FinalPosition'].mean())
+    
+    # Valore Team: media posizione finale storica
+    team_map = df[train_mask_enc].groupby('Team')['FinalPosition'].mean().to_dict()
+    df['Team_Value'] = df['Team'].map(team_map).fillna(df['FinalPosition'].mean())
+
     le_circuit = LabelEncoder()
     df['Circuit_Encoded'] = le_circuit.fit_transform(df['Circuit'])
-    le_team = LabelEncoder()
-    df['Team_Encoded'] = le_team.fit_transform(df['Team'])
     le_compound = LabelEncoder()
     df['Compound_Label'] = le_compound.fit_transform(df['startCompound'])
 
@@ -145,36 +176,38 @@ def main():
     df_dummies = pd.get_dummies(df['startCompound'], prefix='tyre')
     df = pd.concat([df, df_dummies], axis=1)
 
-    # Save encoders
-    joblib.dump(le_driver, 'le_driver.joblib')
+    # Save mapping per predizioni future
+    joblib.dump(driver_map, 'driver_target_map.joblib')
+    joblib.dump(team_map, 'team_target_map.joblib')
     joblib.dump(le_circuit, 'le_circuit.joblib')
-    joblib.dump(le_team, 'le_team.joblib')
     joblib.dump(le_compound, 'le_compound.joblib')
 
-    joblib.dump(list(df_dummies.columns), 'mlp_feature_cols.joblib') #column names One-Hot for prediction
+    features_rf = ['Driver_Value', 'Team_Value', 'Circuit_Encoded', 'Compound_Label',
+                   'GridPosition', 'RecentForm', 'TeamForm', 'DriverStability', 
+                   'CircuitOvertakeFactor', 'TeammateDiff', 'OutPosition', 'TrackGrip', 'is_wet']
+    
+    features_mlp = features_rf + list(df_dummies.columns)
 
-    features_rf = ['Driver_Encoded', 'Team_Encoded', 'Circuit_Encoded', 'Compound_Label',
-                   'GridPosition', 'Humidity', 'Temperature', 'RecentForm', 'is_wet']
-    features_mlp = ['Driver_Encoded', 'Circuit_Encoded', 'GridPosition',
-                    'Humidity', 'Temperature', 'RecentForm', 'is_wet'] + list(df_dummies.columns)
-
-    target = 'FinalPosition'
+    # --- PREPARAZIONE TARGET (DELTA MODE) ---
+    # Prediciamo lo spostamento rispetto alla griglia: Final - Grid
+    # Es: Parte 5°, arriva 3° => Delta = -2 (guadagna posizioni)
+    # Es: Parte 2°, arriva 10° => Delta = +8 (perde posizioni)
+    df['PositionDelta'] = df['FinalPosition'] - df['GridPosition']
+    target = 'PositionDelta'
 
     # Split
     train_mask = (df['Year'] >= 2018) & (df['Year'] <= 2024)
     test_mask = (df['Year'] == 2025)
 
-    # X per Random Forest
+    # X e Y
     X_train_rf = df.loc[train_mask, features_rf]
     X_test_rf = df.loc[test_mask, features_rf]
-
-    # X per MLP
     X_train_mlp = df.loc[train_mask, features_mlp]
     X_test_mlp = df.loc[test_mask, features_mlp]
-
-    # Y
     y_train = df.loc[train_mask, target]
-    y_test = df.loc[test_mask, target]
+    y_test_abs = df.loc[test_mask, 'FinalPosition'] # Per valutazione finale
+    y_test_delta = df.loc[test_mask, target]
+    grid_test = df.loc[test_mask, 'GridPosition']
 
     # --- SCALING (only MLP!) ---
     scaler = RobustScaler()
@@ -184,129 +217,74 @@ def main():
     # --- TRAINING ---
     print("\n--- [CLASSIC] 3. ADDESTRAMENTO DIFFERENZIATO ---")
 
-    # RF
-    #{'n_estimators': 800, 'min_samples_split': 16, 'min_samples_leaf': 10, 'max_features': 0.95, 'max_depth': 27, 'bootstrap': True}
-    '''
-    print("Training RandomForest (Label Mode)...")
-    param_dist = {
-        'n_estimators': [800, 900, 1000, 1100, 1200],  # Numero di alberi (stabilità)
-        'max_depth': [ 25, 26, 27, 28, 29, 30,  None],  # Profondità (capacità di apprendimento)
-        'min_samples_leaf': [2, 5, 7, 10, 12, 15],  # Foglie (controllo overfitting)
-        'min_samples_split': [10, 15, 20, 25],  # Split (precisione dei rami)
-        'max_features': ['sqrt', 'log2', 0.9, 0.97, 0.98, 0.99],  # Feature per albero (biodiversità)
-        'ccp_alpha': [0.0, 0.001, 0.005, 0.01, 0.05, 0.08],
-        'bootstrap': [True]
-    }
-    rf = RandomizedSearchCV(
-        estimator=RandomForestRegressor(random_state=42),
-        param_distributions=param_dist,
-        n_iter=20,  # Ridotto per velocità, puoi aumentarlo
-        cv=3,
-        scoring='neg_mean_absolute_error',
-        n_jobs=-1,
-        verbose=1
+    # 1. DNF Classifier (Nuovo!)
+    print("Training DNF Classifier...")
+    dnf_model = HistGradientBoostingClassifier(random_state=42)
+    dnf_model.fit(X_train_rf, df.loc[train_mask, 'is_DNF'])
+    joblib.dump(dnf_model, 'f1_dnf_classifier.joblib')
+
+    # 2. HistGradientBoosting (Regressore Delta)
+    print("Training HistGradientBoosting Regressor...")
+    hgb = HistGradientBoostingRegressor(
+        loss='absolute_error',
+        max_iter=500,
+        learning_rate=0.03,
+        max_depth=12,
+        l2_regularization=0.5,
+        random_state=42
     )
-    rf.fit(X_train_rf, y_train)
-    best_params = rf.best_params_
-    print(f"\n🏆 Migliori parametri con CCP: {best_params}")
-    joblib.dump(rf, 'f1_rf_best_model.joblib')
-    '''
-    #2,97 => {'n_estimators': 800, 'min_samples_split': 15, 'min_samples_leaf': 7, 'max_features': 0.99, 'max_depth': 29, 'ccp_alpha': 0.08, 'bootstrap': True}
-    rf = RandomForestRegressor(
-        n_estimators=800,
-        min_samples_split=15,
-        min_samples_leaf=7,
-        max_features=0.99,
-        max_depth=29,
-        ccp_alpha=0.08,
-        bootstrap=True)
+    hgb.fit(X_train_rf, y_train)
+    joblib.dump(hgb, 'f1_hgb_model.joblib')
+
+    # 3. Random Forest
+    print("Training RandomForest...")
+    rf = RandomForestRegressor(n_estimators=1000, max_depth=25, min_samples_leaf=7, random_state=42, n_jobs=-1)
     rf.fit(X_train_rf, y_train)
     joblib.dump(rf, 'f1_rf_best_model.joblib')
 
-
-    # MLP
-    #Migliori parametri MLP trovati: {'activation': 'relu', 'alpha': 0.01, 'hidden_layer_sizes': (256, 128, 64), 'learning_rate_init': 0.001, 'max_iter': 3000, 'solver': 'adam'}
-    '''
-    print("Training MLP (One-Hot Mode)...")
-    mlp_param_grid = {
-        # Testiamo diverse profondità: da 3 a 4 strati
-        'hidden_layer_sizes': [
-            (512, 256, 128),  # Grande capacità
-            (256, 128, 64),  # Bilanciata
-            (512, 256, 128, 64),  # Molto profonda per catturare interazioni complesse
-        ],
-        # Tanh spesso performa meglio di ReLU quando i dati sono ben normalizzati
-        'activation': ['relu', 'tanh'],
-        # Alpha è fondamentale: più è alto, più il modello è "protetto" dall'overfitting
-        'alpha': [0.001, 0.05, 0.1],
-        # Learning rate più bassi aiutano a trovare minimi più precisi
-        'learning_rate_init': [0.001, 0.0005],
-        'learning_rate': ['adaptive']
-    }
-
-    # Inizializziamo il regressore con Early Stopping per evitare sprechi di tempo
-    mlp_search = GridSearchCV(
-        estimator=MLPRegressor(max_iter=5000, early_stopping=True, random_state=42),
-        param_grid=mlp_param_grid,
-        cv=3,
-        scoring='neg_mean_absolute_error',  # Il nostro obiettivo primario
-        n_jobs=-1,
-        verbose=2
-    )
-    mlp_search.fit(X_train_mlp_scaled, y_train)
-    mlp = mlp_search.best_estimator_
-    print(f"Migliori parametri MLP trovati: {mlp_search.best_params_}")
-    joblib.dump(mlp, 'f1_mlp_model.joblib')
-
-    '''
-    #{'activation': 'relu', 'alpha': 0.001, 'hidden_layer_sizes': (256, 128, 64), 'learning_rate': 'adaptive', 'learning_rate_init': 0.001}
-    mlp = MLPRegressor(
-        hidden_layer_sizes=(256, 128, 64),  # Struttura a imbuto più profonda
-        activation='relu',  # ReLU va bene, ma alpha deve essere corretto
-        solver='adam',
-        alpha=0.001,  # Aumentato per combattere l'overfitting (L2 penalty)
-        learning_rate='adaptive',  # Riduce il learning rate se il loss non scende
-        learning_rate_init=0.001,  # Partiamo più cauti (default era 0.001)
-        max_iter=5000,
-        early_stopping=True,  # Fondamentale: usa un set di validazione interno
-        validation_fraction=0.1,  # 10% dei dati per decidere quando fermarsi
-        n_iter_no_change=20,  # Pazienza prima di fermarsi
-        random_state=42,
-        batch_size=32
-    )
+    # 4. MLP
+    print("Training MLP (Neural)...")
+    mlp = MLPRegressor(hidden_layer_sizes=(128, 64), activation='tanh', alpha=0.1, max_iter=5000, early_stopping=True, random_state=42)
     mlp.fit(X_train_scaled, y_train)
-    print(f"MLP terminata dopo {mlp.n_iter_} epoche.") # verify if stopped early
     joblib.dump(mlp, 'f1_mlp_model.joblib')
 
+    # --- EVALUATION ---
+    print("\n--- [CLASSIC] RISULTATI TEST SET (2025) - TARGET: DELTA ---")
 
-    # --- EVALUATION DIFFERENZIATA ---
-    print("\n--- [CLASSIC] RISULTATI TEST SET ---")
+    # Predizioni Delta pure
+    hgb_delta = hgb.predict(X_test_rf)
+    rf_delta = rf.predict(X_test_rf)
+    mlp_delta = mlp.predict(X_test_mlp_scaled)
 
-    # Predizioni differenziate
-    rf_pred = rf.predict(X_test_rf)
-    mlp_pred = mlp.predict(X_test_mlp_scaled)
+    # Posizioni Finali (senza "sporcarle" con la probabilità di DNF)
+    hgb_pred = np.clip(grid_test + hgb_delta, 1, 21)
+    rf_pred = np.clip(grid_test + rf_delta, 1, 21)
+    mlp_pred = np.clip(grid_test + mlp_delta, 1, 21)
 
-    # Metriche per Random Forest
-    mae_rf = mean_absolute_error(y_test, rf_pred)
-    r2_rf = r2_score(y_test, rf_pred)
+    # Metriche
+    mae_hgb = mean_absolute_error(y_test_abs, hgb_pred)
+    mae_rf = mean_absolute_error(y_test_abs, rf_pred)
+    mae_mlp = mean_absolute_error(y_test_abs, mlp_pred)
 
-    # Metriche per MLP
-    mae_mlp = mean_absolute_error(y_test, mlp_pred)
-    r2_mlp = r2_score(y_test, mlp_pred)
+    r2_hgb = r2_score(y_test_abs, hgb_pred)
+    r2_rf = r2_score(y_test_abs, rf_pred)
+    r2_mlp = r2_score(y_test_abs, mlp_pred)
 
-    print(f"{'R2 Score (Fit)':<20} | {r2_rf:<15.4f} | {r2_mlp:<15.4f}")
+    print(f"{'METRICA':<20} | {'HGB (V4)':<12} | {'RF':<12} | {'MLP':<12}")
+    print("-" * 65)
+    print(f"{'R2 Score':<20} | {r2_hgb:<12.4f} | {r2_rf:<12.4f} | {r2_mlp:<12.4f}")
+    print(f"{'MAE (Posizioni)':<20} | {mae_hgb:<12.2f} | {mae_rf:<12.2f} | {mae_mlp:<12.2f}")
 
     print("\n" + "-" * 40)
-    print(f"🔹 RANDOM FOREST: Errore medio di {mae_rf:.2f} posizioni")
-    print(f"🔹 MLP (NEURAL):  Errore medio di {mae_mlp:.2f} posizioni")
+    print(f"🚀 MIGLIOR MODELLO: {min([('HGB', mae_hgb), ('RF', mae_rf), ('MLP', mae_mlp)], key=lambda x: x[1])[0]}")
     print("-" * 40)
 
     if hasattr(rf, 'feature_importances_'):
-        feat_imp = dict(zip(features_rf, rf.feature_importances_))
-        print(f"\nFocus 'RecentForm': Importanza {feat_imp.get('RecentForm', 0):.4f}")
-        print(f"Focus 'is_wet':     Importanza {feat_imp.get('is_wet', 0):.4f}")
+        print("\nIMPORTANZA FEATURE (Random Forest):")
+        feat_imp = sorted(zip(features_rf, rf.feature_importances_), key=lambda x: x[1], reverse=True)
+        for name, imp in feat_imp:
+            print(f"🔹 {name:<20}: {imp:.4f}")
 
-    print("=" * 55 + "\n")
 
 if __name__ == "__main__":
     main()
