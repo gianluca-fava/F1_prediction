@@ -1,3 +1,4 @@
+import eli5
 import pandas as pd
 import numpy as np
 import joblib
@@ -16,6 +17,10 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.preprocessing import PowerTransformer
 from sklearn.preprocessing import RobustScaler
+from eli5.sklearn import PermutationImportance
+import matplotlib.pyplot as plt
+import pandas as pd
+from treeinterpreter import treeinterpreter as ti
 
 def load_and_process_data():
     print("--- [CLASSIC] 1. CARICAMENTO DATI ---")
@@ -111,7 +116,13 @@ def main():
         df = load_and_process_data()
 
         #If the pilot is using a compound for rain at the start => the race is wet
-        df['is_wet'] = df['startCompound'].apply(lambda x: 1 if x in ['INTERMEDIATE', 'WET'] else 0)
+        wet_pattern = 'INTERMEDIATE|WET'
+        df['driver_touched_wet'] = df['Compound'].str.contains(wet_pattern, case=False, na=False).astype(int)
+        df['total_wet_drivers'] = df.groupby(['Year', 'Circuit'])['driver_touched_wet'].transform('sum')
+        df['is_wet'] = (df['total_wet_drivers'] >= 2).astype(int)
+        df.drop(columns=['driver_touched_wet', 'total_wet_drivers'], inplace=True)
+        wet_race = df[df['is_wet'] == 1][['Year', 'Circuit']].drop_duplicates().shape[0]
+        print(f"✅ Analisi completata. Gare bagnate trovate: {wet_race}")
 
         # --- RECENT FORM ---
         print("RecentForm calcoulation...")
@@ -146,17 +157,18 @@ def main():
     df = pd.concat([df, df_dummies], axis=1)
 
     # Save encoders
-    joblib.dump(le_driver, 'le_driver.joblib')
-    joblib.dump(le_circuit, 'le_circuit.joblib')
-    joblib.dump(le_team, 'le_team.joblib')
-    joblib.dump(le_compound, 'le_compound.joblib')
+    joblib.dump(le_driver, 'joblib/le_driver.joblib')
+    joblib.dump(le_circuit, 'joblib/le_circuit.joblib')
+    joblib.dump(le_team, 'joblib/le_team.joblib')
+    joblib.dump(le_compound, 'joblib/le_compound.joblib')
 
-    joblib.dump(list(df_dummies.columns), 'mlp_feature_cols.joblib') #column names One-Hot for prediction
+    joblib.dump(list(df_dummies.columns), 'joblib/mlp_feature_cols.joblib') #column names One-Hot for prediction
 
     features_rf = ['Driver_Encoded', 'Team_Encoded', 'Circuit_Encoded', 'Compound_Label',
                    'GridPosition', 'Humidity', 'Temperature', 'RecentForm', 'is_wet']
     features_mlp = ['Driver_Encoded', 'Circuit_Encoded', 'GridPosition',
                     'Humidity', 'Temperature', 'RecentForm', 'is_wet'] + list(df_dummies.columns)
+
 
     target = 'FinalPosition'
 
@@ -181,20 +193,22 @@ def main():
     X_train_scaled = scaler.fit_transform(X_train_mlp)
     X_test_mlp_scaled = scaler.transform(X_test_mlp)
 
+
     # --- TRAINING ---
     print("\n--- [CLASSIC] 3. ADDESTRAMENTO DIFFERENZIATO ---")
 
     # RF
     #{'n_estimators': 800, 'min_samples_split': 16, 'min_samples_leaf': 10, 'max_features': 0.95, 'max_depth': 27, 'bootstrap': True}
+
     '''
     print("Training RandomForest (Label Mode)...")
     param_dist = {
-        'n_estimators': [800, 900, 1000, 1100, 1200],  # Numero di alberi (stabilità)
+        'n_estimators': [800, 900, 1000, 1100, 1200, 1500, 1800, 2000],  # Numero di alberi (stabilità)
         'max_depth': [ 25, 26, 27, 28, 29, 30,  None],  # Profondità (capacità di apprendimento)
         'min_samples_leaf': [2, 5, 7, 10, 12, 15],  # Foglie (controllo overfitting)
-        'min_samples_split': [10, 15, 20, 25],  # Split (precisione dei rami)
+        'min_samples_split': [5, 10, 15, 20, 25],  # Split (precisione dei rami)
         'max_features': ['sqrt', 'log2', 0.9, 0.97, 0.98, 0.99],  # Feature per albero (biodiversità)
-        'ccp_alpha': [0.0, 0.001, 0.005, 0.01, 0.05, 0.08],
+        'ccp_alpha': [0.0, 0.001, 0.005, 0.01, 0.05, 0.08, 0.1, 0.2],
         'bootstrap': [True]
     }
     rf = RandomizedSearchCV(
@@ -221,52 +235,59 @@ def main():
         ccp_alpha=0.08,
         bootstrap=True)
     rf.fit(X_train_rf, y_train)
-    joblib.dump(rf, 'f1_rf_best_model.joblib')
+    joblib.dump(rf, 'joblib/f1_rf_best_model.joblib')
 
 
     # MLP
     #Migliori parametri MLP trovati: {'activation': 'relu', 'alpha': 0.01, 'hidden_layer_sizes': (256, 128, 64), 'learning_rate_init': 0.001, 'max_iter': 3000, 'solver': 'adam'}
-    '''
+
     print("Training MLP (One-Hot Mode)...")
     mlp_param_grid = {
-        # Testiamo diverse profondità: da 3 a 4 strati
+        # 1. Architetture: Esploriamo varianti attorno alla (256, 128, 64)
         'hidden_layer_sizes': [
-            (512, 256, 128),  # Grande capacità
-            (256, 128, 64),  # Bilanciata
-            (512, 256, 128, 64),  # Molto profonda per catturare interazioni complesse
+            (256, 128, 64),      # Il tuo attuale "best"
+            (128, 64, 32),       # Più snella (meno rischio overfitting)
+            (256, 256, 128, 64), # Più profonda all'inizio
+            (512, 256, 64),      # Più "potente" nello strato di input
         ],
-        # Tanh spesso performa meglio di ReLU quando i dati sono ben normalizzati
+        # 2. Regolarizzazione: Testiamo valori vicini allo 0.1
+        'alpha': [0.05, 0.1, 0.15, 0.2], 
+        
+        # 3. Velocità di apprendimento: Testiamo la sensibilità attorno allo 0.0005
+        'learning_rate_init': [0.0005, 0.0003, 0.001],
+        
+        # 4. Funzioni di attivazione
         'activation': ['relu', 'tanh'],
-        # Alpha è fondamentale: più è alto, più il modello è "protetto" dall'overfitting
-        'alpha': [0.001, 0.05, 0.1],
-        # Learning rate più bassi aiutano a trovare minimi più precisi
-        'learning_rate_init': [0.001, 0.0005],
-        'learning_rate': ['adaptive']
+        
+        # 5. Batch size: Può influenzare molto la convergenza (stabilità del gradiente)
+        'batch_size': [32, 64]
     }
 
     # Inizializziamo il regressore con Early Stopping per evitare sprechi di tempo
+
     mlp_search = GridSearchCV(
-        estimator=MLPRegressor(max_iter=5000, early_stopping=True, random_state=42),
+        estimator=MLPRegressor(max_iter=5000, validation_fraction=0.1, n_iter_no_change=20, early_stopping=True, random_state=42),
         param_grid=mlp_param_grid,
         cv=3,
         scoring='neg_mean_absolute_error',  # Il nostro obiettivo primario
         n_jobs=-1,
         verbose=2
     )
-    mlp_search.fit(X_train_mlp_scaled, y_train)
+    mlp_search.fit(X_train_scaled, y_train)
     mlp = mlp_search.best_estimator_
     print(f"Migliori parametri MLP trovati: {mlp_search.best_params_}")
     joblib.dump(mlp, 'f1_mlp_model.joblib')
 
     '''
     #{'activation': 'relu', 'alpha': 0.001, 'hidden_layer_sizes': (256, 128, 64), 'learning_rate': 'adaptive', 'learning_rate_init': 0.001}
+    #{'activation': 'relu', 'alpha': 0.1, 'hidden_layer_sizes': (256, 128, 64), 'learning_rate': 'adaptive', 'learning_rate_init': 0.0005}
     mlp = MLPRegressor(
         hidden_layer_sizes=(256, 128, 64),  # Struttura a imbuto più profonda
         activation='relu',  # ReLU va bene, ma alpha deve essere corretto
         solver='adam',
-        alpha=0.001,  # Aumentato per combattere l'overfitting (L2 penalty)
+        alpha=0.1,  # Aumentato per combattere l'overfitting (L2 penalty)
         learning_rate='adaptive',  # Riduce il learning rate se il loss non scende
-        learning_rate_init=0.001,  # Partiamo più cauti (default era 0.001)
+        learning_rate_init=0.0005,  # Partiamo più cauti (default era 0.001)
         max_iter=5000,
         early_stopping=True,  # Fondamentale: usa un set di validazione interno
         validation_fraction=0.1,  # 10% dei dati per decidere quando fermarsi
@@ -276,8 +297,9 @@ def main():
     )
     mlp.fit(X_train_scaled, y_train)
     print(f"MLP terminata dopo {mlp.n_iter_} epoche.") # verify if stopped early
-    joblib.dump(mlp, 'f1_mlp_model.joblib')
+    joblib.dump(mlp, 'joblib/f1_mlp_model.joblib')
 
+    '''
 
     # --- EVALUATION DIFFERENZIATA ---
     print("\n--- [CLASSIC] RISULTATI TEST SET ---")
@@ -294,19 +316,13 @@ def main():
     mae_mlp = mean_absolute_error(y_test, mlp_pred)
     r2_mlp = r2_score(y_test, mlp_pred)
 
+
     print(f"{'R2 Score (Fit)':<20} | {r2_rf:<15.4f} | {r2_mlp:<15.4f}")
 
     print("\n" + "-" * 40)
     print(f"🔹 RANDOM FOREST: Errore medio di {mae_rf:.2f} posizioni")
     print(f"🔹 MLP (NEURAL):  Errore medio di {mae_mlp:.2f} posizioni")
     print("-" * 40)
-
-    if hasattr(rf, 'feature_importances_'):
-        feat_imp = dict(zip(features_rf, rf.feature_importances_))
-        print(f"\nFocus 'RecentForm': Importanza {feat_imp.get('RecentForm', 0):.4f}")
-        print(f"Focus 'is_wet':     Importanza {feat_imp.get('is_wet', 0):.4f}")
-
-    print("=" * 55 + "\n")
 
 if __name__ == "__main__":
     main()

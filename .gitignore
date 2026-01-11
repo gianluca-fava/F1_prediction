@@ -5,6 +5,8 @@ f1_cache/
 *.sqlite
 *.db
 
+*.csv
+
 # Escludi cartelle di sistema e IDE
 .DS_Store
 .idea/

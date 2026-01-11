@@ -6,11 +6,11 @@ import os
 
 def load_artifacts():
     try:
-        rf = joblib.load('f1_rf_model.joblib')
-        mlp = joblib.load('f1_mlp_model.joblib')
+        rf = joblib.load('joblib/f1_rf_model.joblib')
+        mlp = joblib.load('joblib/f1_mlp_model.joblib')
         scaler = joblib.load('scaler.joblib')
-        le_driver = joblib.load('le_driver.joblib')
-        le_circuit = joblib.load('le_circuit.joblib')
+        le_driver = joblib.load('joblib/le_driver.joblib')
+        le_circuit = joblib.load('joblib/le_circuit.joblib')
         
         return rf, mlp, scaler, le_driver, le_circuit
     except Exception as e:
