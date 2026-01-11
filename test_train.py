@@ -17,6 +17,13 @@ from sklearn.model_selection import RandomizedSearchCV
 
 # Configurazioni base
 os.environ['OMP_NUM_THREADS'] = '1'
+MODEL_DIR = 'joblib'
+DATA_PATH = 'f1_dataset_processed.parquet'
+
+# Crea la cartella joblib se non esiste
+if not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR)
+    print(f"📁 Cartella '{MODEL_DIR}' creata.")
 
 def load_and_process_data():
     print("--- [CLASSIC] 1. CARICAMENTO DATI ---")
@@ -159,26 +166,6 @@ def compute_f1_elo(df, k_factor=10):
     return elo_before_race
 
 
-
-'''def apply_advanced_form(df):
-    print("📈 Calcolo della RecentDeltaForm (Weighted Position Gain)...")
-    df = df.sort_values(by=['Driver', 'Year', 'Circuit'])
-
-    # Delta: quante posizioni ha recuperato (positivo = rimonta, negativo = crollo)
-    df['PosDelta'] = df['GridPosition'] - df['FinalPosition']
-
-    def weighted_average(x):
-        if len(x) == 0: return 0
-        weights = np.array([0.5, 0.3, 0.2])[:len(x)]
-        weights = weights / weights.sum()
-        return np.sum(x * weights)
-
-    # Applichiamo la media pesata sulle ultime 3 gare (esclusa la corrente)
-    df['RecentDeltaForm'] = df.groupby('Driver')['PosDelta'].transform(
-        lambda x: x.shift(1).rolling(window=3, min_periods=1).apply(weighted_average)
-    )
-    return df.fillna({'RecentDeltaForm': 0})
-'''
 def main():
     processed_data_path = 'f1_dataset_processed.parquet'
 
@@ -214,12 +201,6 @@ def main():
 
     print("\n--- [RF OPTIMIZED] 2. PREPARAZIONE DATASET ---")
 
-
-    '''
-    # Calcolo RecentForm (Media ultime 3 gare)
-    df = apply_advanced_form(df)
-    df['Driver_Elo'] = compute_f1_elo(df, k_factor=2)
-    '''
 
     # --- 1. CALCOLO ELO RATING (Sostituisce Driver_Encoded) ---
     print("\n📊 Calcolo Elo Rating per i piloti...")
@@ -289,191 +270,12 @@ def main():
     rf.fit(X_train_rf, y_train)
 
 
-import os
-import pandas as pd
-import numpy as np
-import joblib
-import sys
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.inspection import permutation_importance
-from sklearn.model_selection import RandomizedSearchCV
-
-
-# Configurazioni base
-os.environ['OMP_NUM_THREADS'] = '1'
-
-def load_and_process_data():
-    print("--- [CLASSIC] 1. CARICAMENTO DATI ---")
-    import glob
-    data_files = glob.glob(os.path.join('data', 'full_data', '*.parquet'))
-    dfs = []  # list of dataset to concatenate all of them in 1 time
-    for f in data_files:
-        try:
-            df_temp = pd.read_parquet(f)
-            # Compatibility fix: raw files usually lack SessionType but are Race data
-            if 'SessionType' not in df_temp.columns:
-                df_temp['SessionType'] = 'R'
-
-            dfs.append(df_temp)  # add the df to the list of pieces of the df
-            print(f"Caricato: {os.path.basename(f)} ({len(df_temp)} righe)")
-        except FileNotFoundError:
-            continue
-
-    if not dfs:
-        print("ERRORE: Nessun file dati trovato.")
-        sys.exit(1)  # stop if list is void
-
-    df = pd.concat(dfs, ignore_index=True)
-    df = df.drop_duplicates()
-    df = df[df['SessionType'] == 'R']
-
-    # Aggregazione
-    grouped = df.groupby(['Year', 'EventName', 'Driver'])
-    data = []
-    for (year, event, driver), group in grouped:
-        group = group.sort_values('LapNumber')
-
-        team = group['Team'].iloc[0] if 'Team' in group.columns else 'Unknown'
-
-        # TOTAL LAPS OF THE RACE
-        # Max lap number on the dataset for that race
-        total_race_laps = df[(df['Year'] == year) & (df['EventName'] == event)]['LapNumber'].max()
-        laps_completed = group['LapNumber'].max()
-        is_classified = laps_completed >= (total_race_laps * 0.9)
-
-        # START POSITION
-        # if the starting pos is nan => the pilot has not started the race => we use 0 to say DNS (do not started)
-        start_pos_raw = group.iloc[0]['Position']
-        grid_pos = start_pos_raw if pd.notna(start_pos_raw) else 0
-        if grid_pos == 0:
-            print(f"🚩 [DNS] {driver} @ {event} ({year})")
-
-        # DNF (Do Not Finish) - Last lap = NaN OR he hasn't completed 90% of the race laps => DNF
-        final_pos_raw = group.iloc[-1]['Position']
-        if pd.isna(final_pos_raw) or not is_classified:
-            final_pos = 21
-            print(f"🏳️ [DNF] {driver} @ {event} ({year})")
-        else:
-            final_pos = final_pos_raw
-
-        # COMPOUND
-        valid_compounds = group['Compound'].dropna()
-        if not valid_compounds.empty:
-            # first compound registred (lap 1 or 2)
-            start_compound = valid_compounds.iloc[0]
-        else:
-            start_compound = 'Unknown'
-            print(f"⚠️ [WARN] COMPOUND NOT FOUND {driver} @ {event} ({year})")
-
-        # WETHER
-        humidity = group['AvgHumidity'].mean()  # average humidity for all the race
-        temperature = group['AvgTrackTemp'].mean()  # average temperature for all the race
-
-        data.append({
-            'Year': year,
-            'Driver': driver,
-            'Team': team,
-            'Circuit': event,
-            'startCompound': start_compound,
-            'GridPosition': grid_pos,
-            'Humidity': humidity,
-            'Temperature': temperature,
-            'FinalPosition': final_pos
-        })
-
-    return pd.DataFrame(data)
-
-
-def compute_f1_elo(df, k_factor=10):
-    # 1. Ordiniamo cronologicamente
-    df = df.sort_values(by=['Year', 'Circuit']).reset_index(drop=True)
-
-    # 2. Inizializziamo i rating (tutti a 1500)
-    unique_drivers = df['Driver'].unique()
-    current_ratings = {driver: 1500.0 for driver in unique_drivers}
-
-    # Lista per memorizzare i rating PRIMA della gara (quelli che userà il modello)
-    elo_before_race = []
-
-    # 3. Iteriamo per ogni gara
-    grouped = df.groupby(['Year', 'Circuit'], sort=False)
-
-    for (year, circuit), race_df in grouped:
-        # Memorizziamo i rating attuali per questa gara
-        race_drivers = race_df['Driver'].tolist()
-        for driver in race_drivers:
-            elo_before_race.append(current_ratings[driver])
-
-        # Aggiorniamo i rating basandoci sui risultati della gara
-        # Confrontiamo ogni coppia di piloti nella gara
-        new_ratings = current_ratings.copy()
-
-        drivers_list = race_df.to_dict('records')
-        for i in range(len(drivers_list)):
-            for j in range(i + 1, len(drivers_list)):
-                p1 = drivers_list[i]
-                p2 = drivers_list[j]
-
-                d1_name = p1['Driver']
-                d2_name = p2['Driver']
-
-                # Rating attuali
-                r1 = current_ratings[d1_name]
-                r2 = current_ratings[d2_name]
-
-                # Punteggio atteso
-                e1 = 1 / (1 + 10 ** ((r2 - r1) / 400))
-                e2 = 1 - e1
-
-                # Risultato reale (S=1 se arrivi prima, S=0.5 se pari, S=0 se dopo)
-                if p1['FinalPosition'] < p2['FinalPosition']:
-                    s1, s2 = 1, 0
-                elif p1['FinalPosition'] > p2['FinalPosition']:
-                    s1, s2 = 0, 1
-                else:
-                    s1, s2 = 0.5, 0.5
-
-                # Update dei rating temporanei (accumuliamo i cambiamenti)
-                new_ratings[d1_name] += k_factor * (s1 - e1)
-                new_ratings[d2_name] += k_factor * (s2 - e2)
-
-        # Applichiamo i nuovi rating per la prossima gara
-        current_ratings = new_ratings
-
-    return elo_before_race
-
-
-
-'''def apply_advanced_form(df):
-    print("📈 Calcolo della RecentDeltaForm (Weighted Position Gain)...")
-    df = df.sort_values(by=['Driver', 'Year', 'Circuit'])
-
-    # Delta: quante posizioni ha recuperato (positivo = rimonta, negativo = crollo)
-    df['PosDelta'] = df['GridPosition'] - df['FinalPosition']
-
-    def weighted_average(x):
-        if len(x) == 0: return 0
-        weights = np.array([0.5, 0.3, 0.2])[:len(x)]
-        weights = weights / weights.sum()
-        return np.sum(x * weights)
-
-    # Applichiamo la media pesata sulle ultime 3 gare (esclusa la corrente)
-    df['RecentDeltaForm'] = df.groupby('Driver')['PosDelta'].transform(
-        lambda x: x.shift(1).rolling(window=3, min_periods=1).apply(weighted_average)
-    )
-    return df.fillna({'RecentDeltaForm': 0})
-'''
 def main():
-    processed_data_path = 'f1_dataset_processed.parquet'
 
     # --- 1. CARICAMENTO E PRE-PROCESSING ---
-    if os.path.exists(processed_data_path):
-        print(f"📦 Caricamento dataset elaborato da {processed_data_path}...")
-        df = pd.read_parquet(processed_data_path)
+    if os.path.exists(DATA_PATH):
+        print(f"📦 Caricamento dataset elaborato da {DATA_PATH}...")
+        df = pd.read_parquet(DATA_PATH)
     else:
         print("🛠 Dataset non trovato. Avvio elaborazione completa...")
         df = load_and_process_data()  # Assicurati che sia definita nel file
@@ -498,16 +300,10 @@ def main():
         # Fallback per valori mancanti
         df['RecentForm'] = df['RecentForm'].fillna(df['GridPosition'])
         df['TeamForm'] = df['TeamForm'].fillna(df['GridPosition'])
-
+        df.to_parquet(DATA_PATH, index=False)
 
     print("\n--- [RF OPTIMIZED] 2. PREPARAZIONE DATASET ---")
 
-
-    '''
-    # Calcolo RecentForm (Media ultime 3 gare)
-    df = apply_advanced_form(df)
-    df['Driver_Elo'] = compute_f1_elo(df, k_factor=2)
-    '''
 
     # --- 1. CALCOLO ELO RATING (Sostituisce Driver_Encoded) ---
     print("\n📊 Calcolo Elo Rating per i piloti...")
@@ -518,6 +314,9 @@ def main():
     df['Team_Encoded'] = le_team.fit_transform(df['Team'])
     le_compound = LabelEncoder()
     df['Compound_Label'] = le_compound.fit_transform(df['startCompound'])
+
+    joblib.dump(le_team, os.path.join(MODEL_DIR, 'le_team.joblib'))
+    joblib.dump(le_compound, os.path.join(MODEL_DIR, 'le_compound.joblib'))
 
     # --- FEATURE SELECTION (Basata sui test precedenti) ---
     # Rimosse feature che causano rumore: Driver_Encoded, Humidity, Circuit_Encoded
@@ -576,7 +375,9 @@ def main():
         ccp_alpha=0.1,
         bootstrap=True)
     rf.fit(X_train_rf, y_train)
-    joblib.dump(rf, 'f1_rf_best_model.joblib')
+    model_file = os.path.join(MODEL_DIR, 'f1_rf_best_model.joblib')
+    joblib.dump(rf, model_file)
+
 
     # --- 4. EVALUATION ---
     rf_pred = rf.predict(X_test_rf)
@@ -618,3 +419,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
