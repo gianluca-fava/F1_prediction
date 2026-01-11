@@ -15,7 +15,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.model_selection import GridSearchCV
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.preprocessing import PowerTransformer
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, MinMaxScaler
 
 def load_and_process_data():
     print("--- [CLASSIC] 1. CARICAMENTO DATI ---")
@@ -181,7 +181,21 @@ def main():
     X_train_scaled = scaler.fit_transform(X_train_mlp)
     X_test_mlp_scaled = scaler.transform(X_test_mlp)
 
-    # --- TRAINING ---
+    # --- TARGET SCALING (New for MLP Stability) ---
+    scaler_y = MinMaxScaler() 
+    y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1)).ravel()
+    
+    joblib.dump(scaler, 'scaler_mlp.joblib')
+    joblib.dump(scaler_y, 'scaler_y_mlp.joblib')
+
+    # Save encoders (Moved here for clarity)
+    joblib.dump(le_driver, 'le_driver.joblib')
+    joblib.dump(le_circuit, 'le_circuit.joblib')
+    joblib.dump(le_team, 'le_team.joblib')
+    joblib.dump(le_compound, 'le_compound.joblib')
+
+    joblib.dump(list(df_dummies.columns), 'mlp_feature_cols.joblib') 
+
     print("\n--- [CLASSIC] 3. ADDESTRAMENTO DIFFERENZIATO ---")
 
     # RF
@@ -260,21 +274,22 @@ def main():
 
     '''
     #{'activation': 'relu', 'alpha': 0.001, 'hidden_layer_sizes': (256, 128, 64), 'learning_rate': 'adaptive', 'learning_rate_init': 0.001}
+    print("Training MLP (Scaled Mode)...")
     mlp = MLPRegressor(
-        hidden_layer_sizes=(256, 128, 64),  # Struttura a imbuto più profonda
-        activation='relu',  # ReLU va bene, ma alpha deve essere corretto
+        hidden_layer_sizes=(128, 64, 32),  # Semplificato
+        activation='relu',
         solver='adam',
-        alpha=0.001,  # Aumentato per combattere l'overfitting (L2 penalty)
-        learning_rate='adaptive',  # Riduce il learning rate se il loss non scende
-        learning_rate_init=0.001,  # Partiamo più cauti (default era 0.001)
+        alpha=0.01,  # Aumentato per regolarizzazione
+        learning_rate='adaptive',
+        learning_rate_init=0.001,
         max_iter=5000,
-        early_stopping=True,  # Fondamentale: usa un set di validazione interno
-        validation_fraction=0.1,  # 10% dei dati per decidere quando fermarsi
-        n_iter_no_change=20,  # Pazienza prima di fermarsi
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=20,
         random_state=42,
         batch_size=32
     )
-    mlp.fit(X_train_scaled, y_train)
+    mlp.fit(X_train_scaled, y_train_scaled)
     print(f"MLP terminata dopo {mlp.n_iter_} epoche.") # verify if stopped early
     joblib.dump(mlp, 'f1_mlp_model.joblib')
 
@@ -284,7 +299,10 @@ def main():
 
     # Predizioni differenziate
     rf_pred = rf.predict(X_test_rf)
-    mlp_pred = mlp.predict(X_test_mlp_scaled)
+    
+    # MLP Pred (Inverse Transform)
+    mlp_pred_scaled = mlp.predict(X_test_mlp_scaled)
+    mlp_pred = scaler_y.inverse_transform(mlp_pred_scaled.reshape(-1, 1)).ravel()
 
     # Metriche per Random Forest
     mae_rf = mean_absolute_error(y_test, rf_pred)
