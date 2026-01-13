@@ -4,288 +4,229 @@ import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import warnings
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.inspection import permutation_importance
 
-# Configurazione Plot
+# --- CONFIGURAZIONI ---
+warnings.filterwarnings("ignore", category=FutureWarning)
 sns.set_theme(style="whitegrid")
 plt.rcParams['figure.figsize'] = (12, 8)
 
+
+# --- FUNZIONI DI SUPPORTO ---
+
 def load_artifacts():
-    print("📦 Caricamento modelli e artefatti...")
+    print("📦 Caricamento modelli e artefatti dalla cartella 'joblib'...")
+    base_path = "joblib"
     artifacts = {}
+    files_to_load = {
+        'rf': 'f1_rf_best_model.joblib',
+        'mlp': 'f1_mlp_best_model.joblib',
+        'le_driver': 'le_driver.joblib',  # Usato da MLP
+        'le_team': 'le_team.joblib',  # Usato da entrambi
+        'le_circuit': 'le_circuit.joblib',  # Usato da MLP
+        'le_compound': 'le_compound.joblib',  # Usato da entrambi
+        'scaler': 'scaler_mlp.joblib',
+        'mlp_cols': 'mlp_feature_cols.joblib'
+    }
     try:
-        artifacts['rf'] = joblib.load('f1_rf_best_model.joblib')
-        artifacts['mlp'] = joblib.load('f1_mlp_model.joblib')
-        artifacts['le_driver'] = joblib.load('le_driver.joblib')
-        artifacts['le_team'] = joblib.load('le_team.joblib')
-        artifacts['le_circuit'] = joblib.load('le_circuit.joblib')
-        artifacts['le_compound'] = joblib.load('le_compound.joblib')
-        artifacts['scaler'] = joblib.load('scaler_mlp.joblib')
-        artifacts['scaler_y'] = joblib.load('scaler_y_mlp.joblib')
-        artifacts['mlp_cols'] = joblib.load('mlp_feature_cols.joblib')
+        for key, filename in files_to_load.items():
+            full_path = os.path.join(base_path, filename)
+            artifacts[key] = joblib.load(full_path)
         print("✅ Tutto caricato correttamente.")
-    except FileNotFoundError as e:
-        print(f"❌ Errore: File mancante -> {e}")
-        exit(1)
+    except Exception as e:
+        print(f"❌ Errore caricamento: {e}")
+        raise e
     return artifacts
+
 
 def prepare_data(df, artifacts):
     print("⚙️ Preparazione dati di test (Stagione 2025)...")
-    
-    # Filtra solo 2025
-    df = df[df['Year'] == 2025].copy()
-    
-    if df.empty:
-        print("❌ Nessun dato trovato per l'anno 2025.")
-        exit(1)
+    df_2025 = df[df['Year'] == 2025].copy()
+    if df_2025.empty: return None, None, None
 
-    # 1. Label Encoding (gestione etichette non viste con fallback)
-    def safe_transform(encoder, series):
-        # Se ci sono label non viste, le mappiamo a -1 o al primo valore (meglio gestire eccezioni)
-        # Qui assumiamo che il training abbia visto tutto o usiamo un try/except riga per riga se necessario
-        # Dato che encoders sono fittati su tutto il dataset nel training script, dovrebbe andare bene.
-        return encoder.transform(series)
+    # --- 1. ENCODING PER MLP ---
+    # MLP usa ancora Driver e Circuit encoded
+    df_2025['Driver_Encoded'] = artifacts['le_driver'].transform(df_2025['Driver'])
+    df_2025['Circuit_Encoded'] = artifacts['le_circuit'].transform(df_2025['Circuit'])
 
-    df['Driver_Encoded'] = safe_transform(artifacts['le_driver'], df['Driver'])
-    df['Team_Encoded'] = safe_transform(artifacts['le_team'], df['Team'])
-    df['Circuit_Encoded'] = safe_transform(artifacts['le_circuit'], df['Circuit'])
-    df['Compound_Label'] = safe_transform(artifacts['le_compound'], df['startCompound'])
+    # --- 2. ENCODING COMUNE (RF & MLP) ---
+    df_2025['Team_Encoded'] = artifacts['le_team'].transform(df_2025['Team'])
+    df_2025['Compound_Label'] = artifacts['le_compound'].transform(df_2025['startCompound'])
 
-    # 2. Features per RF
-    features_rf = ['Driver_Encoded', 'Team_Encoded', 'Circuit_Encoded', 'Compound_Label',
-                   'GridPosition', 'Humidity', 'Temperature', 'RecentForm', 'is_wet']
-    
-    X_rf = df[features_rf]
+    # --- 3. FEATURES RF (Versione Ottimizzata) ---
+    # Usiamo esattamente la lista del tuo nuovo training
+    features_rf = [
+        'GridPosition',
+        'RecentForm',
+        'Team_Encoded',
+        'Compound_Label',
+        'Driver_Elo',
+        'is_wet'
+    ]
+    X_rf = df_2025[features_rf]
 
-    # 3. Features per MLP (One-Hot + Scaling)
-    # Ricrea dummies
-    df_dummies = pd.get_dummies(df['startCompound'], prefix='tyre')
-    
-    # Assicura che ci siano tutte le colonne usate in training
-    for col in artifacts['mlp_cols']:
-        if col not in df_dummies.columns:
-            df_dummies[col] = 0
-    
-    # Seleziona solo quelle giuste nell'ordine giusto
-    df_dummies = df_dummies[artifacts['mlp_cols']]
-    
+    # --- 4. FEATURES MLP (One-Hot + Base) ---
+    df_dummies = pd.get_dummies(df_2025['startCompound'], prefix='tyre')
+    df_mlp_full = pd.concat([df_2025, df_dummies], axis=1)
+
     base_mlp_feats = ['Driver_Encoded', 'Circuit_Encoded', 'GridPosition',
                       'Humidity', 'Temperature', 'RecentForm', 'is_wet']
-    
-    X_mlp = pd.concat([df[base_mlp_feats], df_dummies], axis=1)
-    
-    # Scaling
-    X_mlp_scaled = artifacts['scaler'].transform(X_mlp)
 
-    return df, X_rf, X_mlp_scaled
+    tyre_cols = artifacts['mlp_cols']
+    full_features_mlp = base_mlp_feats + tyre_cols
 
+    for col in tyre_cols:
+        if col not in df_mlp_full.columns:
+            df_mlp_full[col] = 0
+
+    X_mlp_final = df_mlp_full[full_features_mlp]
+    X_mlp_scaled = artifacts['scaler'].transform(X_mlp_final)
+
+    return df_2025, X_rf, X_mlp_scaled
+
+
+# --- FUNZIONI DI PLOTTING (Invariate) ---
 def plot_scatter(y_true, y_pred, model_name, ax):
-    sns.scatterplot(x=y_true, y=y_pred, alpha=0.6, edgecolor=None, ax=ax)
-    
-    # Linea ideale
-    ax.plot([1, 21], [1, 21], 'r--', lw=2, label='Perfetta Previsione')
-    
-    # Configurazione Assi per gestire DNF e Scala
+    sns.scatterplot(x=y_true, y=y_pred, alpha=0.6, ax=ax)
+    ax.plot([1, 21], [1, 21], 'r--', lw=2, label='Ideale')
     ax.set_title(f'{model_name}: Reale vs Predetto')
-    ax.set_xlabel('Posizione Reale')
-    ax.set_ylabel('Posizione Predetta')
-    
-    # Forza i limiti per evitare scale enormi (es. 70)
-    ax.set_xlim(0.5, 22)
-    ax.set_ylim(0.5, 22)
-    
-    # Etichette personalizzate per DNF
-    ticks = [1, 5, 10, 15, 20, 21]
-    labels = ['1', '5', '10', '15', '20', 'DNF']
-    
-    ax.set_xticks(ticks)
-    ax.set_xticklabels(labels)
-    ax.set_yticks(ticks)
-    ax.set_yticklabels(labels)
-    
-    ax.legend(loc='upper left')
+    ax.set_xlim(0.5, 21.5);
+    ax.set_ylim(0.5, 21.5)
+    ax.invert_yaxis()
+
 
 def plot_residuals(y_true, y_pred, model_name, ax):
     residuals = y_true - y_pred
     sns.histplot(residuals, kde=True, bins=20, ax=ax, color='orange')
     ax.axvline(0, color='r', linestyle='--')
-    ax.set_title(f'{model_name}: Distribuzione Errori (Residui)')
-    ax.set_xlabel('Errore (Posizioni)')
+    ax.set_title(f'{model_name}: Residui')
+
 
 def plot_race_comparison(df, model_name, pred_col, filename, selected_races=None):
-    """Visualizza 3 gare specifiche o Monaco + casuali"""
     races_in_df = df['Circuit'].unique()
-    
     if selected_races is None:
-        selected_races = []
-        # 1. Cerca Monaco
-        monaco_names = ['Monaco Grand Prix', 'Monaco']
-        for m in monaco_names:
-            if m in races_in_df:
-                selected_races.append(m)
-                break
-                
-        # 2. Riempi con altri random
-        remaining_races = [r for r in races_in_df if r not in selected_races]
-        n_needed = 3 - len(selected_races)
-        
-        if len(remaining_races) >= n_needed:
-            random_picks = np.random.choice(remaining_races, n_needed, replace=False)
-            selected_races.extend(random_picks)
-        else:
-            selected_races.extend(remaining_races)
-    
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
-    fig.suptitle(f'Dettaglio Gara: {model_name} (Classifica Piloti)', fontsize=16)
-
+        selected_races = np.random.choice(races_in_df, min(3, len(races_in_df)), replace=False)
+    fig, axes = plt.subplots(1, len(selected_races), figsize=(18, 6), sharey=True)
+    if len(selected_races) == 1: axes = [axes]
     for i, race in enumerate(selected_races):
-        if race not in races_in_df:
-            print(f"⚠️ Avviso: La gara '{race}' non è presente nei dati 2025.")
-            continue
-            
-        # Ordina per posizione REALE
         race_data = df[df['Circuit'] == race].sort_values('FinalPosition')
-        
         ax = axes[i]
-        
-        x_indices = range(len(race_data))
-        
-        # Clip delle predizioni per il plot (così non vanno fuori grafico)
-        y_pred_clipped = np.clip(race_data[pred_col], 1, 21)
-        
-        ax.plot(x_indices, race_data['FinalPosition'], 'o-', label='Reale', color='black', markersize=8)
-        ax.plot(x_indices, y_pred_clipped, 'x--', label='Predetto', color='red', markersize=8)
-        
-        ax.set_xticks(x_indices)
-        ax.set_xticklabels(race_data['Driver'], rotation=90, fontsize=9)
-        ax.set_title(f"GP: {race}")
-        
-        # Gestione asse Y con DNF
-        ax.set_ylim(0.5, 21.5)
-        ticks = [1, 5, 10, 15, 20, 21]
-        labels = ['1', '5', '10', '15', '20', 'DNF']
-        ax.set_yticks(ticks)
-        ax.set_yticklabels(labels)
-        ax.invert_yaxis() # 1st is top
-        
-        if i == 0:
-            ax.set_ylabel("Posizione Finale")
-            ax.legend()
-        
+        x = range(len(race_data))
+        ax.plot(x, race_data['FinalPosition'], 'o-', label='Reale', color='black')
+        ax.plot(x, np.clip(race_data[pred_col], 1, 21), 'x--', label='Predetto', color='red')
+        ax.set_xticks(x)
+        ax.set_xticklabels(race_data['Driver'], rotation=90)
+        ax.set_title(race)
+        ax.invert_yaxis()
     plt.tight_layout()
     plt.savefig(filename)
-    print(f"💾 Grafico salvato: {filename}")
-    # plt.show()
+
 
 def plot_best_worst_races(df, model_name, pred_col, filename):
-    """Identifica e plotta la gara con l'errore minore (Best) e maggiore (Worst)"""
     races = df['Circuit'].unique()
-    race_metrics = []
-
+    metrics = []
     for race in races:
-        race_data = df[df['Circuit'] == race]
-        # Calcolo MAE (Mean Absolute Error) per questa gara
-        mae = np.mean(np.abs(race_data['FinalPosition'] - race_data[pred_col]))
-        race_metrics.append((race, mae))
+        rd = df[df['Circuit'] == race]
+        mae = np.mean(np.abs(rd['FinalPosition'] - rd[pred_col]))
+        metrics.append((race, mae))
+    metrics.sort(key=lambda x: x[1])
+    best, worst = metrics[0][0], metrics[-1][0]
+    plot_race_comparison(df, model_name, pred_col, filename, selected_races=[best, worst])
 
-    # Ordina per errore: [0] è Best, [-1] è Worst
-    race_metrics.sort(key=lambda x: x[1])
-    
-    best_race_name, best_mae = race_metrics[0]
-    worst_race_name, worst_mae = race_metrics[-1]
-    
-    selected_races = [best_race_name, worst_race_name]
-    titles = [f"BEST: {best_race_name} (Err: {best_mae:.2f})", f"WORST: {worst_race_name} (Err: {worst_mae:.2f})"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
-    fig.suptitle(f'{model_name}: Best vs Worst Prediction Performance', fontsize=16)
-
-    for i, race in enumerate(selected_races):
-        # Ordina per posizione REALE
-        race_data = df[df['Circuit'] == race].sort_values('FinalPosition')
-        ax = axes[i]
-        x_indices = range(len(race_data))
-        
-        # Clip predizioni
-        y_pred_clipped = np.clip(race_data[pred_col], 1, 21)
-        
-        ax.plot(x_indices, race_data['FinalPosition'], 'o-', label='Reale', color='green', markersize=8)
-        ax.plot(x_indices, y_pred_clipped, 'x--', label='Predetto', color='red', markersize=8)
-        
-        ax.set_xticks(x_indices)
-        ax.set_xticklabels(race_data['Driver'], rotation=90, fontsize=9)
-        ax.set_title(titles[i], fontweight='bold')
-        
-        # Gestione Assi
-        ax.set_ylim(0.5, 21.5)
-        ticks = [1, 5, 10, 15, 20, 21]
-        labels = ['1', '5', '10', '15', '20', 'DNF']
-        ax.set_yticks(ticks)
-        ax.set_yticklabels(labels)
-        ax.invert_yaxis()
-        
-        if i == 0:
-            ax.set_ylabel("Posizione Finale")
-            ax.legend()
-            
-    plt.tight_layout()
-    plt.savefig(filename)
-    print(f"💾 Grafico salvato: {filename}")
-
+# --- MAIN ---
 def main():
-    # 1. Carica Dataset
     if not os.path.exists('f1_dataset_processed.parquet'):
-        print("Dataset non trovato. Esegui prima train_classic.py per generarlo.")
+        print("❌ Dataset mancante!")
         return
-        
-    df = pd.read_parquet('f1_dataset_processed.parquet')
-    
-    # 2. Carica Modelli
-    artifacts = load_artifacts()
-    
-    # 3. Prepara Dati
-    df_test, X_rf, X_mlp = prepare_data(df, artifacts)
-    y_true = df_test['FinalPosition']
-    
-    # 4. Predizioni
-    print("🔮 Generazione predizioni...")
-    pred_rf = artifacts['rf'].predict(X_rf)
-    
-    # MLP Pred (Inverse Transform)
-    pred_mlp_scaled = artifacts['mlp'].predict(X_mlp)
-    pred_mlp = artifacts['scaler_y'].inverse_transform(pred_mlp_scaled.reshape(-1, 1)).ravel()
-    
-    df_test['Pred_RF'] = pred_rf
-    df_test['Pred_MLP'] = pred_mlp
 
-    # 5. Plotting Generale
-    print("📊 Generazione grafici...")
-    
-    # Figura 1: Scatter e Residui
+    df = pd.read_parquet('f1_dataset_processed.parquet')
+    artifacts = load_artifacts()
+
+    # 3. Prepara Dati
+    df_test, X_rf, X_mlp_scaled = prepare_data(df, artifacts)
+    if 'Driver_Elo' not in df.columns:
+        print("⚠️ Colonna 'Driver_Elo' non trovata. La sto calcolando ora...")
+        # Se hai la funzione compute_f1_elo importala o incollala qui
+        # df['Driver_Elo'] = compute_f1_elo(df, k_factor=2)
+        # Se non vuoi ricalcolarla qui, devi rieseguire il training script
+        print("❌ Errore: Riesegui il training script per generare il dataset con i ratings Elo.")
+        return
+    if df_test is None: return
+
+    y_true = df_test['FinalPosition']
+
+    print("🔮 Generazione predizioni...")
+    # Predizione RF + Post-processing (arrotondamento e clipping come nel training)
+    rf_raw_pred = artifacts['rf'].predict(X_rf)
+    df_test['Pred_RF'] = np.round(np.clip(rf_raw_pred, 1, 21))
+
+    # Predizione MLP
+    df_test['Pred_MLP'] = artifacts['mlp'].predict(X_mlp_scaled)
+
+    # --- 1. EVALUATION METRICS ---
+    mae_rf = mean_absolute_error(y_true, df_test['Pred_RF'])
+    r2_rf = r2_score(y_true, df_test['Pred_RF'])
+    mae_mlp = mean_absolute_error(y_true, df_test['Pred_MLP'])
+    r2_mlp = r2_score(y_true, df_test['Pred_MLP'])
+
+    print("\n" + "=" * 55)
+    print(f"📊 PERFORMANCE EVALUATION (TEST 2025)")
+    print("-" * 55)
+    print(f"{'Modello':<20} | {'MAE':<10} | {'R2':<10}")
+    print("-" * 55)
+    print(f"{'RF Optimized':<20} | {mae_rf:<10.4f} | {r2_rf:<10.4f}")
+    print(f"{'MLP Neural':<20} | {mae_mlp:<10.4f} | {r2_mlp:<10.4f}")
+    print("=" * 55)
+
+    # --- 2. PERMUTATION IMPORTANCE (Random Forest) ---
+    print("\n📊 Calcolo Permutation Importance (RF - Optimized)...")
+    perm_rf = permutation_importance(artifacts['rf'], X_rf, y_true, n_repeats=10, random_state=42, n_jobs=-1)
+
+    features_rf_names = X_rf.columns
+    sorted_idx_rf = perm_rf.importances_mean.argsort()[::-1]
+
+    print("\n🏆 Feature Ranking - RANDOM FOREST (Elo Mode):")
+    print("-" * 55)
+    for i in sorted_idx_rf:
+        print(f"{features_rf_names[i]:<20} | {perm_rf.importances_mean[i]:.4f} +/- {perm_rf.importances_std[i]:.4f}")
+
+    # --- 3. PERMUTATION IMPORTANCE (MLP) ---
+    print("\n📊 Calcolo Permutation Importance (MLP)...")
+    perm_mlp = permutation_importance(artifacts['mlp'], X_mlp_scaled, y_true, n_repeats=10, random_state=42, n_jobs=-1)
+
+    base_mlp_feats = ['Driver_Encoded', 'Circuit_Encoded', 'GridPosition', 'Humidity', 'Temperature', 'RecentForm',
+                      'is_wet']
+    full_features_mlp = base_mlp_feats + artifacts['mlp_cols']
+    sorted_idx_mlp = perm_mlp.importances_mean.argsort()[::-1]
+
+    print("\n🏆 Feature Ranking - MLP (Top 10):")
+    print("-" * 55)
+    for i in sorted_idx_mlp[:10]:
+        print(f"{full_features_mlp[i]:<20} | {perm_mlp.importances_mean[i]:.4f} +/- {perm_mlp.importances_std[i]:.4f}")
+
+    # --- 4. PLOTTING ---
+    os.makedirs('plots', exist_ok=True)
+    print("\n🎨 Generazione grafici...")
+
     fig, axs = plt.subplots(2, 2, figsize=(16, 12))
-    
-    plot_scatter(y_true, pred_rf, "Random Forest", axs[0, 0])
-    plot_residuals(y_true, pred_rf, "Random Forest", axs[0, 1])
-    
-    plot_scatter(y_true, pred_mlp, "MLP (Neural Net)", axs[1, 0])
-    plot_residuals(y_true, pred_mlp, "MLP (Neural Net)", axs[1, 1])
-    
+    plot_scatter(y_true, df_test['Pred_RF'], "RF Optimized", axs[0, 0])
+    plot_residuals(y_true, df_test['Pred_RF'], "RF Optimized", axs[0, 1])
+    plot_scatter(y_true, df_test['Pred_MLP'], "MLP Neural", axs[1, 0])
+    plot_residuals(y_true, df_test['Pred_MLP'], "MLP Neural", axs[1, 1])
     plt.tight_layout()
     plt.savefig('plots/results_scatter_residuals.png')
-    print("💾 Grafico salvato: plots/results_scatter_residuals.png")
-    # plt.show()
-    
-    # Figura 2: Dettaglio Gare RF
+
     rf_races = ['Australian Grand Prix', 'Qatar Grand Prix', 'British Grand Prix']
     plot_race_comparison(df_test, "Random Forest", 'Pred_RF', 'plots/results_rf_races.png', selected_races=rf_races)
-    
-    # Figura 3: Dettaglio Gare MLP
     plot_race_comparison(df_test, "MLP", 'Pred_MLP', 'plots/results_mlp_races.png')
-
-    # Figura 4: Best vs Worst (RF)
     plot_best_worst_races(df_test, "Random Forest", 'Pred_RF', 'plots/results_rf_best_worst.png')
-
-    # Figura 5: Best vs Worst (MLP)
     plot_best_worst_races(df_test, "MLP", 'Pred_MLP', 'plots/results_mlp_best_worst.png')
+
+    print("✅ Fine. Grafici salvati in /plots")
+
 
 if __name__ == "__main__":
     main()

@@ -4,10 +4,13 @@ import numpy as np
 import joblib
 import sys
 import glob
+from sklearn.neural_network import MLPRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.inspection import permutation_importance
+from sklearn.preprocessing import RobustScaler, MinMaxScaler
+
 
 # Configurazioni base
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -125,32 +128,35 @@ def train_model_pipeline(df):
     """Accorpa preparazione feature, encoding e addestramento."""
     print("\n--- [1. PREPARAZIONE FEATURE & ENCODING] ---")
 
-    # Inizializzazione e Fit Encoders
+    # --- ENCODING ---
+    # Inizializziamo tutti gli encoder necessari
+    le_driver = LabelEncoder()
     le_team = LabelEncoder()
+    le_circuit = LabelEncoder()
     le_compound = LabelEncoder()
 
+    df['Driver_Encoded'] = le_driver.fit_transform(df['Driver'])
     df['Team_Encoded'] = le_team.fit_transform(df['Team'])
+    df['Circuit_Encoded'] = le_circuit.fit_transform(df['Circuit'])
     df['Compound_Label'] = le_compound.fit_transform(df['startCompound'])
 
-    # Salvataggio Encoders
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    joblib.dump(le_team, os.path.join(MODEL_DIR, 'le_team.joblib'))
-    joblib.dump(le_compound, os.path.join(MODEL_DIR, 'le_compound.joblib'))
-
-    # Selezione Feature
-    features_rf = ['GridPosition', 'RecentForm', 'Team_Encoded', 'Compound_Label', 'Driver_Elo', 'is_wet']
-    target = 'FinalPosition'
+    # Salvataggio Encoders (TUTTI quelli necessari per MLP e RF)
+    for name, le in zip(['driver', 'team', 'circuit', 'compound'], [le_driver, le_team, le_circuit, le_compound]):
+        joblib.dump(le, os.path.join(MODEL_DIR, f'le_{name}.joblib'))
 
     # Split Temporale (Train < 2025, Test == 2025)
     train_mask = df['Year'] < 2025
     test_mask = df['Year'] == 2025
 
-    X_train = df.loc[train_mask, features_rf]
+    # Selezione Feature
+    features_rf = ['GridPosition', 'RecentForm', 'Team_Encoded', 'Compound_Label', 'Driver_Elo', 'is_wet']
+    target = 'FinalPosition'
+    X_train_rf = df.loc[train_mask, features_rf]
+    X_test_rf = df.loc[test_mask, features_rf]
     y_train = df.loc[train_mask, target]
-    X_test = df.loc[test_mask, features_rf]
     y_test = df.loc[test_mask, target]
 
-    print(f"🚀 [2. TRAINING] Avvio RandomForest su {len(features_rf)} feature...")
+    print(f"🚀 Training RandomForest...")
     rf = RandomForestRegressor(
         n_estimators=1000,
         min_samples_split=15,
@@ -162,39 +168,82 @@ def train_model_pipeline(df):
         n_jobs=-1,
         random_state=42
     )
-    rf.fit(X_train, y_train)
+    rf.fit(X_train_rf, y_train)
+    joblib.dump(rf, os.path.join(MODEL_DIR, 'f1_rf_best_model.joblib'))
+    print(f"✅ Modello Random Forest salvato")
 
-    # Salvataggio Modello
-    model_path = os.path.join(MODEL_DIR, 'f1_rf_best_model.joblib')
-    joblib.dump(rf, model_path)
-    print(f"✅ Modello salvato in: {model_path}")
+    # --- MLP SECTION (One-Hot & Scaling) ---
+    print("🧠 Preparazione MLP...")
+    df_dummies = pd.get_dummies(df['startCompound'], prefix='tyre')
+    df_mlp = pd.concat([df, df_dummies], axis=1)
 
-    return rf, X_test, y_test, features_rf
+    # Salviamo le colonne dummy per coerenza in inferenza (one hot encoding)
+    joblib.dump(list(df_dummies.columns), os.path.join(MODEL_DIR, 'mlp_feature_cols.joblib'))
 
+    features_mlp = ['Driver_Encoded', 'Circuit_Encoded', 'GridPosition', 'Humidity', 'Temperature', 'RecentForm', 'is_wet'] + list(df_dummies.columns)
 
-def evaluate_model(model, X_test, y_test, feature_names):
+    X_train_mlp = df_mlp.loc[train_mask, features_mlp]
+    X_test_mlp = df_mlp.loc[test_mask, features_mlp]
+
+    # Scaling Input
+    scaler_x = RobustScaler()
+    X_train_scaled = scaler_x.fit_transform(X_train_mlp)
+    X_test_mlp_scaled = scaler_x.transform(X_test_mlp)
+    joblib.dump(scaler_x, os.path.join(MODEL_DIR, 'scaler_mlp.joblib'))
+
+    # Scaling Target (MinMaxScaler per portare 1-21 in range 0-1)
+    scaler_y = MinMaxScaler()
+    y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1)).ravel()
+    joblib.dump(scaler_y, os.path.join(MODEL_DIR, 'scaler_y_mlp.joblib'))
+
+    print(f"🔥 Training MLP...")
+    mlp = MLPRegressor(
+        hidden_layer_sizes=(256, 256, 128, 64),  # Struttura a imbuto più profonda
+        activation='tanh',  # ReLU va bene, ma alpha deve essere corretto
+        solver='adam',
+        alpha=0.15,  # Aumentato per combattere l'overfitting (L2 penalty)
+        learning_rate='adaptive',  # Riduce il learning rate se il loss non scende
+        learning_rate_init=0.0005,  # Partiamo più cauti (default era 0.001)
+        max_iter=5000,
+        early_stopping=True,  # Fondamentale: usa un set di validazione interno
+        validation_fraction=0.1,  # 10% dei dati per decidere quando fermarsi
+        n_iter_no_change=20,  # Pazienza prima di fermarsi
+        random_state=42,
+        batch_size=32
+    )
+    mlp.fit(X_train_scaled, y_train_scaled)
+    joblib.dump(mlp, os.path.join(MODEL_DIR, 'f1_mlp_best_model.joblib'))
+    print(f"✅ Modello MLP salvato")
+
+    return rf, mlp, X_test_rf, X_test_mlp_scaled, y_test, scaler_y, features_rf
+
+def evaluate_model(rf, mlp, X_test_rf, X_test_mlp, y_test, scaler_y, feature_names):
     """Valutazione delle performance e Permutation Importance."""
     print("\n--- [3. VALUTAZIONE] ---")
 
-    # Predizione con Clipping e Rounding
-    raw_preds = model.predict(X_test)
-    preds = np.round(np.clip(raw_preds, 1, 21))
+    # RF Evaluation
+    rf_preds = np.round(np.clip(rf.predict(X_test_rf), 1, 21))
+    mae_rf = mean_absolute_error(y_test, rf_preds)
+    r2_rf = r2_score(y_test, rf_preds)
 
-    mae = mean_absolute_error(y_test, preds)
-    r2 = r2_score(y_test, preds)
+    # MLP Evaluation
+    mlp_pred_scaled = mlp.predict(X_test_mlp)
+    # Riportiamo i valori da 0-1 a 1-21
+    mlp_preds = scaler_y.inverse_transform(mlp_pred_scaled.reshape(-1, 1)).ravel()
+    mae_mlp = mean_absolute_error(y_test, mlp_preds)
+    r2_mlp = r2_score(y_test, mlp_preds)
 
-    print("=" * 45)
-    print(f"MAE:      {mae:.4f} posizioni")
-    print(f"R2 Score: {r2:.4f}")
-    print("=" * 45)
+    print(f"{'MODELLO':<20} | {'R2 Score':<15} | {'MAE':<15}")
+    print("-" * 55)
+    print(f"{'Random Forest':<20} | {r2_rf:<15.4f} | {mae_rf:<15.2f}")
+    print(f"{'MLP (Neural)':<20} | {r2_mlp:<15.4f} | {mae_mlp:<15.2f}")
 
     print("\n📊 Calcolo Permutation Importance...")
-    perm = permutation_importance(model, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1)
+    perm = permutation_importance(rf, X_test_rf, y_test, n_repeats=10, random_state=42, n_jobs=-1)
 
     sorted_idx = perm.importances_mean.argsort()[::-1]
     for i in sorted_idx:
         print(f"{feature_names[i]:<20} | {perm.importances_mean[i]:.4f} +/- {perm.importances_std[i]:.4f}")
-
 
 def main():
     # --- GESTIONE DATASET ---
@@ -212,10 +261,10 @@ def main():
 
     # --- PIPELINE DI TRAINING ---
     # Accorpa preparazione dati, encoding e addestramento
-    rf_model, X_test, y_test, features_rf = train_model_pipeline(df)
+    rf, mlp, X_test_rf, X_test_mlp, y_test, scaler_y, features_rf = train_model_pipeline(df)
 
     # --- VALUTAZIONE ---
-    evaluate_model(rf_model, X_test, y_test, features_rf)
+    evaluate_model(rf, mlp, X_test_rf, X_test_mlp, y_test, scaler_y, features_rf)
 
 if __name__ == "__main__":
     main()
