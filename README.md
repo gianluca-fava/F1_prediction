@@ -17,7 +17,7 @@ This framework predict Formula 1 race results. It utilizes **Random Forest** and
 Ensure you have Python installed. You can install the required libraries using the provided requirements file:
 
 ```bash
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ## Usage Workflow

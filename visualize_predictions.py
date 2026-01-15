@@ -10,7 +10,7 @@ sns.set_theme(style="whitegrid")
 plt.rcParams['figure.figsize'] = (12, 8)
 
 def load_artifacts():
-    print("📦 Loading models and artifacts...")
+    print("Loading models and artifacts")
     artifacts = {}
     try:
         artifacts['rf'] = joblib.load('joblib/f1_rf_best_model.joblib')
@@ -22,20 +22,20 @@ def load_artifacts():
         artifacts['scaler'] = joblib.load('joblib/scaler_mlp.joblib')
         artifacts['scaler_y'] = joblib.load('joblib/scaler_y_mlp.joblib')
         artifacts['mlp_cols'] = joblib.load('joblib/mlp_feature_cols.joblib')
-        print("✅ Models loaded")
+        print("Models loaded")
     except FileNotFoundError as e:
-        print(f"❌ Error: Missing file: {e}")
+        print(f"Error: Missing file: {e}")
         exit(1)
     return artifacts
 
 def prepare_data(df, artifacts):
-    print("⚙️ Preparing test data (2025 Season)...")
+    print("Preparing test data (2025 Season)")
     
     # Filter only 2025
     df = df[df['Year'] == 2025].copy()
     
     if df.empty:
-        print("❌ No data found for the year 2025.")
+        print("No data found for the year 2025")
         exit(1)
 
     # 1. Label Encoding (handling unseen labels with fallback)
@@ -138,7 +138,7 @@ def plot_race_comparison(df, model_name, pred_col, filename, selected_races=None
 
     for i, race in enumerate(selected_races):
         if race not in races_in_df:
-            print(f"⚠️ Warning: The race '{race}' is not present in 2025 data.")
+            print(f"Warning: The race '{race}' is not present in 2025 data")
             continue
             
         # Sort by REAL position
@@ -172,7 +172,7 @@ def plot_race_comparison(df, model_name, pred_col, filename, selected_races=None
         
     plt.tight_layout()
     plt.savefig(filename)
-    print(f"💾 Plot saved: {filename}")
+    print(f"Plot saved: {filename}")
     # plt.show()
 
 def plot_best_worst_races(df, model_name, pred_col, filename):
@@ -238,11 +238,11 @@ def plot_best_worst_races(df, model_name, pred_col, filename):
         model_clean = model_name.replace(" ", "_").replace("(", "").replace(")", "").lower()
         csv_filename = f"plots/{model_clean}_{race_type}_race.csv"
         comparison_df.to_csv(csv_filename, index=False)
-        print(f"💾 Table saved: {csv_filename}")
+        print(f"Table saved: {csv_filename}")
             
     plt.tight_layout()
     plt.savefig(filename)
-    print(f"💾 Plot saved: {filename}")
+    print(f"Plot saved: {filename}")
 
 def main():
     # 1. Load Dataset
@@ -260,7 +260,7 @@ def main():
     y_true = df_test['FinalPosition']
     
     # 4. Predictions
-    print("🔮 Generating predictions...")
+    print("Generating predictions...")
     pred_rf = artifacts['rf'].predict(X_rf)
     
     # MLP Pred (Inverse Transform)
@@ -271,7 +271,7 @@ def main():
     df_test['Pred_MLP'] = pred_mlp
 
     # 5. General Plotting
-    print("📊 Generating plots...")
+    print("Generating plots...")
     
     # Figure 1: Scatter and Residuals
     fig, axs = plt.subplots(2, 2, figsize=(16, 12))
@@ -284,7 +284,7 @@ def main():
     
     plt.tight_layout()
     plt.savefig('plots/results_scatter_residuals.png')
-    print("💾 Plot saved: plots/results_scatter_residuals.png")
+    print("Plot saved: plots/results_scatter_residuals.png")
     # plt.show()
     
     # Figure 2: RF Race Detail

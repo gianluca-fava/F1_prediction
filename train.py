@@ -21,10 +21,10 @@ if not os.path.exists(MODEL_DIR):
     os.makedirs(MODEL_DIR)
 
 def load_raw_data():
-    print("📂 Loading raw parquet files...")
+    print("Loading raw parquet files")
     data_files = glob.glob(os.path.join('data', 'full_data', '*.parquet'))
     if not data_files:
-        print("❌ ERROR: No files found in data/full_data/")
+        print("Error: No files found in data/full_data/")
         sys.exit(1)
 
     dfs = [pd.read_parquet(f) for f in data_files]
@@ -76,7 +76,7 @@ def process_race_results(df):
 
 
 def compute_f1_elo(df, k_factor=10):
-    print("📊 Calculating dynamic Elo Rating...")
+    print("Calculating dynamic Elo Rating")
     df = df.sort_values(by=['Year', 'Circuit']).reset_index(drop=True) # chronological order
     unique_drivers = df['Driver'].unique() # Initialize ratings (all at 1500)
     current_ratings = {driver: 1500.0 for driver in unique_drivers}
@@ -107,7 +107,7 @@ def compute_f1_elo(df, k_factor=10):
 
 
 def add_features(df):
-    print("📈 Calculating RecentForm and TeamForm...")
+    print("Calculating RecentForm and TeamForm")
     # Is Wet logic
     wet_pattern = 'INTERMEDIATE|WET'
     df['is_wet'] = df.groupby(['Year', 'Circuit'])['startCompound'].transform(
@@ -156,7 +156,7 @@ def train_model_pipeline(df):
     y_train = df.loc[train_mask, target]
     y_test = df.loc[test_mask, target]
 
-    print(f"🚀 Training RandomForest...")
+    print(f"Training RandomForest")
     rf = RandomForestRegressor(
         n_estimators=1000,
         min_samples_split=15,
@@ -170,10 +170,10 @@ def train_model_pipeline(df):
     )
     rf.fit(X_train_rf, y_train)
     joblib.dump(rf, os.path.join(MODEL_DIR, 'f1_rf_best_model.joblib'))
-    print(f"✅ Random Forest model saved")
+    print(f"Random Forest model saved")
 
     # --- MLP SECTION (One-Hot & Scaling) ---
-    print("🧠 Preparing MLP...")
+    print("Preparing MLP")
     df_dummies = pd.get_dummies(df['startCompound'], prefix='tyre')
     df_mlp = pd.concat([df, df_dummies], axis=1)
 
@@ -196,7 +196,7 @@ def train_model_pipeline(df):
     y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1)).ravel()
     joblib.dump(scaler_y, os.path.join(MODEL_DIR, 'scaler_y_mlp.joblib'))
 
-    print(f"🔥 Training MLP...")
+    print(f"Training MLP")
     mlp = MLPRegressor(
         hidden_layer_sizes=(256, 256, 128, 64),
         activation='tanh',
@@ -213,7 +213,7 @@ def train_model_pipeline(df):
     )
     mlp.fit(X_train_scaled, y_train_scaled)
     joblib.dump(mlp, os.path.join(MODEL_DIR, 'f1_mlp_best_model.joblib'))
-    print(f"✅ MLP model saved")
+    print(f"MLP model saved")
 
     return rf, mlp, X_test_rf, X_test_mlp_scaled, y_test, scaler_y, features_rf
 
@@ -238,7 +238,7 @@ def evaluate_model(rf, mlp, X_test_rf, X_test_mlp, y_test, scaler_y, feature_nam
     print(f"{'Random Forest':<20} | {r2_rf:<15.4f} | {mae_rf:<15.2f}")
     print(f"{'MLP (Neural)':<20} | {r2_mlp:<15.4f} | {mae_mlp:<15.2f}")
 
-    print("\n📊 Calculating Permutation Importance...")
+    print("\nCalculating Permutation Importance")
     perm = permutation_importance(rf, X_test_rf, y_test, n_repeats=10, random_state=42, n_jobs=-1)
 
     sorted_idx = perm.importances_mean.argsort()[::-1]
@@ -248,16 +248,16 @@ def evaluate_model(rf, mlp, X_test_rf, X_test_mlp, y_test, scaler_y, feature_nam
 def main():
     # --- DATASET MANAGEMENT ---
     if os.path.exists(DATA_PATH):
-        print(f"📦 Loading existing dataset: {DATA_PATH}")
+        print(f"Loading existing dataset: {DATA_PATH}")
         df = pd.read_parquet(DATA_PATH)
     else:
-        print("🛠 Dataset not found. Starting full processing...")
+        print("Dataset not found. Starting full processing")
         # Ensure load_raw_data, process_race_results, and add_features are imported/defined
         df = load_raw_data()
         df = process_race_results(df)
         df = add_features(df)
         df.to_parquet(DATA_PATH, index=False)
-        print(f"✅ Dataset saved successfully.")
+        print(f"Dataset saved successfully.")
 
     # --- TRAINING PIPELINE ---
     # Combines data preparation, encoding, and training

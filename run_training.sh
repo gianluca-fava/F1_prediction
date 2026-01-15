@@ -6,7 +6,7 @@ export VECLIB_MAXIMUM_THREADS=1
 echo "=== AVVIO TRAINING F1 PREDICTION ==="
 
 echo ">> Step 1: Modelli Classici (RandomForest, MLP)..."
-python3 train_classic.py
+python3 train.py
 if [ $? -ne 0 ]; then
     echo "Errore durante il training classico."
     exit 1
