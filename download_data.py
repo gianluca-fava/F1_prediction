@@ -5,16 +5,16 @@ import logging
 
 # --- CONFIGURATION ---
 CACHE_DIR = './f1_cache'
-OUTPUT_DIR = 'data'
+OUTPUT_DIR = 'data/full_data'
 # For Strategy Prediction, 2018-2025 is the "Gold Standard" for data quality
-START_YEAR = 2022
-END_YEAR = 2023
+START_YEAR = 2018
+END_YEAR = 2025
 YEARS_TO_DOWNLOAD = list(range(START_YEAR, END_YEAR + 1))
 
 # Create necessary directories
 for folder in [CACHE_DIR, OUTPUT_DIR]:
     if not os.path.exists(folder):
-        os.makedirs(folder)
+        os.makedirs(folder, exist_ok=True)
 
 # Setup FastF1 cache and logging
 fastf1.Cache.enable_cache(CACHE_DIR)
