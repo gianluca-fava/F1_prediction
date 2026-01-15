@@ -23,34 +23,34 @@ def get_user_input(le_driver, le_circuit):
     
     # --- Driver ---
     while True:
-        driver = input("Inserisci codice Pilota (es. VER, HAM, LEC): ").upper()
+        driver = input("Enter Driver code (e.g., VER, HAM, LEC): ").upper()
         if driver in le_driver.classes_:
             break
-        print(f"Pilota non trovato. Esempi: {', '.join(le_driver.classes_[:5])}...")
+        print(f"Driver not found. Examples: {', '.join(le_driver.classes_[:5])}...")
 
     # --- Circuit ---
     while True:
-        circuit = input("Inserisci nome Circuito (es. Bahrain Grand Prix): ")
+        circuit = input("Enter Circuit name (e.g., Bahrain Grand Prix): ")
         if circuit in le_circuit.classes_:
             break
-        print("Circuito non trovato.")
-        print("Suggerimenti:", ', '.join(le_circuit.classes_[:5]), "...")
-        if input("Lista completa? (s/n): ").lower() == 's':
+        print("Circuit not found.")
+        print("Suggestions:", ', '.join(le_circuit.classes_[:5]), "...")
+        if input("Complete list? (y/n): ").lower() == 'y':
             print(', '.join(le_circuit.classes_))
 
     # --- Grid Position ---
     while True:
         try:
-            grid_pos = float(input("Posizione di partenza (Qualifica): "))
+            grid_pos = float(input("Starting position (Qualifying): "))
             if 1 <= grid_pos <= 20:
                 break
-            print("Deve essere tra 1 e 20.")
+            print("Must be between 1 and 20.")
         except ValueError: pass
 
     # --- Humidity ---
     while True:
         try:
-            humidity = float(input("Umidità (%) (es. 60.5): "))
+            humidity = float(input("Humidity (%) (e.g., 60.5): "))
             if 0 <= humidity <= 100:
                 break
         except ValueError: pass
@@ -80,16 +80,16 @@ def predict():
     pred_rf = rf.predict(X_new)[0]
     pred_mlp = mlp.predict(X_new_scaled)[0]
 
-    print("\n--- RISULTATI PREDIZIONE ---")
-    print(f"Scenario: {driver_in} @ {circuit_in} (Partenza: {int(grid_pos_in)})")
+    print("\n--- PREDICTION RESULTS ---")
+    print(f"Scenario: {driver_in} @ {circuit_in} (Starting: {int(grid_pos_in)})")
     print("-" * 40)
     print(f"RandomForest:  Pos {pred_rf:.2f}")
-    print(f"MLP (Rete):    Pos {pred_mlp:.2f}")
+    print(f"MLP (Neural):  Pos {pred_mlp:.2f}")
     print("-" * 40)
     
     # Simple Ensemble Average
     avg_pred = (pred_rf + pred_mlp) / 2
-    print(f"MEDIA ENSEMBLE: Pos {avg_pred:.2f} -> {int(round(avg_pred))}")
+    print(f"ENSEMBLE AVERAGE: Pos {avg_pred:.2f} -> {int(round(avg_pred))}")
 
 if __name__ == "__main__":
     predict()

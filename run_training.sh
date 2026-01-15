@@ -1,6 +1,4 @@
 #!/bin/bash
-# FIX CRITICO PER MAC OS (Apple Silicon / Intel)
-# Esportiamo queste variabili PRIMA di avviare Python
 export KMP_DUPLICATE_LIB_OK=True
 export OMP_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
